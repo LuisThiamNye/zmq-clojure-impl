@@ -1,0 +1,3 @@
+{:source-paths #{"bb" "src" "test"}
+
+ :linters {:unused-public-var {:exclude #{tasks}}}}

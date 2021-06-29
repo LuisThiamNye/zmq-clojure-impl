@@ -1,0 +1,25 @@
+#+TITLE: zmq
+
+# [![Clojars Project](https://img.shields.io/clojars/v/com.crypticbutter/zmq.svg)](https://clojars.org/com.crypticbutter/zmq)
+
+com.crypticbutter/zmq
+
+* Rationale
+
+  # TODO
+
+* Usage
+
+  # [![Clojars Project](https://img.shields.io/clojars/v/com.crypticbutter/zmq.svg)](https://clojars.org/com.crypticbutter/zmq)
+
+  deps.edn:
+
+#+BEGIN_SRC clojure
+com.crypticbutter/zmq {:mvn/version "0-SNAPSHOT"}
+#+END_SRC
+
+* License
+
+  Copyright © 2021 Luis and contributors.
+
+  Distributed under Eclipse Public License 2.0, see [[./LICENSE][LICENSE]].

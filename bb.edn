@@ -1,0 +1,21 @@
+;;
+{:paths ["bb"]
+
+ :tasks {:requires ([babashka.fs :as fs]
+                    [tasks :as t])
+
+         :init (def -jar-location "target/build/release.jar")
+
+         chui (t/shadow-cljs "-A:lib/cider-nrepl watch test-runner")
+         test (apply shell "./bin/kaocha" *command-line-args*)
+
+         pom (clojure "-Spom")
+
+         jar (clojure "-M:skinnyjar" -jar-location)
+         deploy (clojure "-M:project/clojars" -jar-location)
+         jardeploy {:depends [jar deploy]}
+
+         clean (fs/delete-tree (str "target/" (first *command-line-args*)))
+
+         ;;
+         }}

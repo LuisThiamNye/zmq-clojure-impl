@@ -1,0 +1,7 @@
+#+TITLE: Changelog
+
+A crude record of notable changes.
+
+* Unreleased
+
+  - x
