@@ -9,18 +9,18 @@
 (deftype YQueueChunk
          [^"[Ljava.lang.Object;" values
           ^:ints pos
-          ^:unsynchronized-mutable ^YQueueChunk prev
-          ^:unsynchronized-mutable ^YQueueChunk next]
+          ^:unsynchronized-mutable prev
+          ^:unsynchronized-mutable next]
   YQueueChunkProtocol
   (set-next! [_ v] (set! next v))
   (set-prev! [_ v] (set! prev v))
-  (get-next! [_] next)
-  (get-prev! [_] prev))
+  (get-next [_] next)
+  (get-prev [_] prev))
 
 (defn- new-chunk [size memory-start]
   (->YQueueChunk (make-array Object size)
                  (let [arr (make-array Integer/TYPE size)]
-                   (dotimes [i (range size)]
+                   (dotimes [i size]
                      (aset arr i (+ i memory-start)))
                    arr)
                  nil nil))
@@ -81,14 +81,14 @@
       (do
         (set! end-pos (dec size))
         (set! end-chunk (get-prev end-chunk))
-        (set! (get-next end-chunk) nil))))
+        (set-next! end-chunk nil))))
   (qpop! [_]
     (let [v (aget (.-values begin-chunk) begin-pos)]
       (aset (.-values begin-chunk) begin-pos nil)
       (set! begin-pos (inc begin-pos))
       (when (= size begin-pos)
         (set! begin-chunk (get-next begin-chunk))
-        (set! (get-prev begin-chunk) nil)
+        (set-prev! begin-chunk nil)
         (set! begin-pos 0))
       v)))
 
@@ -107,18 +107,18 @@
 (defprotocol YPipeProtocol
   (write! [_ v incomplete?])
   (pop-incomplete! [_])
-  (flush! [_])
+  (flush! [_] "Returns false if reader is sleeping")
   (readable? [_])
   (read! [_])
   (pipe-peek [_]))
 
 (deftype YPipe
-         [^YQueue queue
-          ^:unsynchronized-mutable ^:int w ;; first un-flushed
-          ^:unsynchronized-mutable ^:int r ;; first un-prefetched
-          ^:unsynchronized-mutable ^:int f ;; first to be flushed
-     ;; last flushed item. Nil if reader is sleeping
-          ^clojure.lang.Atom *c]
+  [^YQueue queue
+   ^:unsynchronized-mutable ^:int w ;; first un-flushed
+   ^:unsynchronized-mutable ^:int r ;; first un-prefetched
+   ^:unsynchronized-mutable ^:int f ;; first to be flushed
+          ;; last flushed item.
+   ^clojure.lang.Atom *c]
   YPipeProtocol
   (write! [_ v incomplete?]
     (qconj! queue v)
@@ -130,8 +130,11 @@
       (back queue)))
   (flush! [_]
     (or (= w f)
-        (do (reset! *c f)
-            (set! w f))))
+        (if (compare-and-set! *c w f)
+          (do (set! w f) true)
+          (do (reset! *c f)
+              (set! w f)
+              false))))
   (readable? [_]
     (let [queue-front-pos (front-pos queue)]
       (or (not (or (= queue-front-pos r)

@@ -1,15 +1,23 @@
 (ns crypticbutter.zmq.impl.pipe
   (:require
    [taoensso.encore :as enc]
-   [crypticbutter.zmq.impl.pipe.ypipe :as ypipe :refer [YPipe]]
-   [crypticbutter.zmq.impl.msg :as msg :refer [Msg]]))
+   [crypticbutter.zmq.impl.pipe.ypipe :as ypipe]
+   [crypticbutter.zmq.impl.mailbox :as mbox]
+   [crypticbutter.zmq.impl.cmd :as cmd :refer [Commandable]]
+   [crypticbutter.zmq.impl.msg :as msg])
+  (:import
+   (crypticbutter.zmq.impl.mailbox Mailbox)
+   (crypticbutter.zmq.impl.msg Msg)
+   (crypticbutter.zmq.impl.pipe.ypipe YPipe)))
 
-(defprotocol Blob
+(defprotocol IsBlob
   (size [_]))
 
 (deftype Blob
          [^:bytes buffer]
+  IsBlob
   (size [_] (.-length buffer))
+
   Object
   (equals [_ other]
     (if (instance? Blob other)
@@ -29,16 +37,24 @@
        (->Blob b))
      (->Blob data))))
 
+(defprotocol PipeEventSink
+  (activate-write! [_ pipe])
+  (activate-read! [_ pipe])
+  (hiccup! [_ pipe])
+  (drop-pipe! [_ pipe] "Called when a pipe is terminated"))
+
 (defprotocol PipeProtocol
-  (set-peer! [_ peer])
+  (set-event-sink! [_ sink])
+  (set-peer! [_ peer-pipe mailbox])
   (set-id! [_ id])
   (get-id [_])
-  (set-routing-id! [_])
+  (set-routing-id! [_ id])
   (get-routing-id [_])
   (set-no-term-delay! [_])
   (get-credential [_])
   (set-disconnect-msg! [_])
   (send-disconnect-msg! [_])
+  (send-hiccup-msg! [_ hiccup-msg])
   (readable? [_])
   (read! [_])
   (writable? [_])
@@ -71,32 +87,38 @@
 (def ^:const stage-term-req-sent 4)
 (def ^:const stage-term-req-sent-peer 5)
 
+(def msg-pipe-granularity 256)
+
 (deftype Pipe
-         [^YPipe in-pipe
-          ^:boolean in-active?
-          ^:int in-lower-limit ;; LWM
-          ^YPipe out-pipe
-          ^:boolean out-active?
-          ^:int out-limit ;; HWM
-          ^:int msg-read-count
-          ^:int msg-write-count
-          ^:int peer-msg-read-count
-          ^:unsynchronized-mutable ^Pipe peer
-          sink
-          ^:int stage
-          recv-msgs-before-term?
-          ^:unsynchronized-mutable id
-          ^:unsynchronized-mutable ^:int routing-id
-          credential
-          conflate?
-          disconnect-msg]
+  [^:unsynchronized-mutable ^YPipe in-pipe
+   ^:unsynchronized-mutable ^:boolean in-active?
+   ^:int in-lower-limit ;; LWM
+   ^:unsynchronized-mutable ^YPipe out-pipe
+   ^:unsynchronized-mutable ^:boolean out-active?
+   ^:int out-limit ;; HWM
+   ^:unsynchronized-mutable ^:int msg-read-count
+   ^:unsynchronized-mutable ^:int msg-write-count
+   ^:unsynchronized-mutable ^:int peer-msg-read-count
+   ^:unsynchronized-mutable peer-pipe
+   ^:unsynchronized-mutable ^Mailbox peer-mbox
+   ^:unsynchronized-mutable sink
+   ^:unsynchronized-mutable ^:int stage
+   ^:unsynchronized-mutable ^:boolean recv-msgs-before-term?
+   ^:unsynchronized-mutable id
+   ^:unsynchronized-mutable ^:int routing-id
+   ^:unsynchronized-mutable credential
+   conflate?
+   ^:unsynchronized-mutable disconnect-msg]
+
   PipeProtocol
-  (set-peer! [_ new-peer]
-    {:pre [(nil? peer)]}
-    (set! peer new-peer))
+  (set-peer! [_ peer mbox]
+    {:pre [(some? peer)]}
+    (set! peer-pipe peer)
+    (set! peer-mbox mbox))
+  (set-event-sink! [_ new-sink] (set! sink new-sink))
   (set-id! [_ new-id] (set! id new-id))
   (get-id [_] id)
-  (set-routing-id [_ new-id] (set! routing-id new-id))
+  (set-routing-id! [_ new-id] (set! routing-id new-id))
   (get-routing-id [_] routing-id)
   (get-credential [_] credential)
   (set-no-term-delay! [_]
@@ -109,7 +131,7 @@
   (flush! [_]
     (when-not (or (= stage stage-term-ack-sent)
                   (or (nil? out-pipe) (ypipe/flush! out-pipe)))
-      (send-active-read! this peer)))
+      (mbox/send! peer-mbox (cmd/new-cmd ::cmd/acitvate-read peer-pipe))))
   (-process-activate-read [this]
     (when (and (not in-active?)
                (or (= stage stage-active) (= stage stage-awaiting-delim)))
@@ -139,25 +161,25 @@
         (do
           (set! stage stage-term-ack-sent)
           (set! out-pipe nil)
-          (send-pipe-term-ack this peer)))
+          (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term-ack peer-pipe))))
 
       stage-delim-received
       (do
         (set! stage stage-term-ack-sent)
         (set! out-pipe nil)
-        (send-pipe-term-ack this peer))
+        (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term-ack peer-pipe)))
 
       stage-term-req-sent
       (do
         (set! stage stage-term-req-sent-peer)
         (set! out-pipe nil)
-        (send-pipe-term-ack this peer))
+        (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term-ack peer-pipe)))
       nil))
   (-process-pipe-term-ack! [this]
     (dispatch-pipe-terminated sink this)
     (when (= stage stage-term-req-sent)
-      (do (set! out-pipe nil)
-          (send-pipe-term-ack this peer)))
+      (set! out-pipe nil)
+      (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term-ack peer-pipe)))
     (when-not conflate? ;; empty inbound pipe
       (while (some? (ypipe/read! in-pipe))))
     (set! in-pipe nil))
@@ -165,8 +187,7 @@
     (if (= stage stage-active)
       (set! stage stage-delim-received)
       (do
-        (set! out-pipe nil)
-        (send-pipe-term-ack! this peer)
+        (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term-ack peer-pipe)) (set! out-pipe nil)
         (set! stage stage-term-ack-sent))))
   (readable? [_]
     (and in-active?
@@ -195,11 +216,12 @@
                 (set! msg-read-count (inc msg-read-count)))
               (when (and (pos? in-lower-limit)
                          (zero? (rem msg-read-count in-lower-limit)))
-                (send-active-write! this peer msg-read-count))
+                (mbox/send! peer-mbox
+                            (cmd/new-cmd ::cmd/activate-write peer-pipe msg-read-count)))
               msg))))))
   (-within-out-limit? [_]
     (<= (- msg-write-count peer-msg-read-count) out-limit))
-  (wriable? [this]
+  (writable? [this]
     (and out-active?
          (= stage stage-active)
          (-within-out-limit? this)))
@@ -215,14 +237,14 @@
     (when (= stage stage-active)
       (set! in-pipe (ypipe/new-ypipe msg-pipe-granularity conflate?))
       (set! in-active? true)
-      (send-hiccup! this peer in-pipe)))
+      (mbox/send! peer-mbox (cmd/new-cmd ::cmd/hiccup peer-pipe in-pipe))))
   (set-disconnect-msg! [this]
     (when-not (or (nil? disconnect-msg) (nil? out-pipe))
       (rollback! this)
       (ypipe/write! out-pipe disconnect-msg false)
       (flush! this)
       (set! disconnect-msg nil)))
-  (send-disconnect-msg! [this]
+  (send-hiccup-msg! [this hiccup-msg]
     (when-not (or (nil? hiccup-msg) (nil? out-pipe))
       (rollback! this)
       (ypipe/write! out-pipe hiccup-msg false)
@@ -235,31 +257,34 @@
             stage-term-ack-sent) nil
       (do
         (enc/case-eval stage
-          stage-active (do (send-pipe-term! this peer)
+          stage-active (do (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term peer-pipe))
                            (set! stage stage-term-req-sent))
           stage-awaiting-delim (when-not recv-msgs-before-term?
                                  (set! out-pipe nil)
-                                 (send-pipe-term-ack! this peer)
+                                 (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term-ack peer-pipe))
                                  (set! stage stage-term-ack-sent))
-          stage-delim-received (do (send-pipe-term! this peer)
+          stage-delim-received (do (mbox/send! peer-mbox (cmd/new-cmd ::cmd/term peer-pipe))
                                    (set! stage stage-term-req-sent)))
         (set! out-active? false)
         (when (some? out-pipe)
           (rollback! this)
           (ypipe/write! out-pipe (msg/new-delimiter-msg) false)
-          (flush! this))))))
+          (flush! this)))))
 
-(defn- new-pipe [in-pipe in-lower-limit out-pipe out-limit conflate?]
+  Commandable)
+
+(defn- new-pipe [in-pipe in-limit out-pipe out-limit conflate?]
   (->Pipe in-pipe
           true ;; input active
-          in-lower-limit
+          (hwm->lwm in-limit)
           out-pipe
           true ;; output active
-          (hwm->lwm out-limit)
+          out-limit
           0 ;; msg read count
           0 ;; msg write count
           0 ;; peer msg read count
-          nil ;; peer
+          nil ;; peer pipe
+          nil ;; peer mailbox
           nil ;; sink
           stage-active
           true ;; delay termination
@@ -269,15 +294,13 @@
           conflate?
           nil))
 
-(def msg-pipe-granularity 256)
-
-(defn new-pipe-pair [hwms conflate1? conflate2?]
-  (let [ypipe1 (new-ypipe msg-pipe-granularity conflate1?)
-        ypipe2 (new-ypipe msg-pipe-granularity conflate2?)
-        pipe1 (new-pipe ypipe1 ypipe2 conflate1?)
-        pipe2 (new-pipe ypipe1 ypipe2 conflate1?)]
-    (set-peer! pipe1 pipe2)
-    (set-peer! pipe2 pipe1)
+(defn new-pipe-pair [mbox1 mbox2 hwm1 hwm2 conflate1? conflate2?]
+  (let [ypipe1 (ypipe/new-ypipe msg-pipe-granularity conflate1?)
+        ypipe2 (ypipe/new-ypipe msg-pipe-granularity conflate2?)
+        pipe1 (new-pipe ypipe1 ypipe2 hwm2 hwm1 conflate1?)
+        pipe2 (new-pipe ypipe2 ypipe1 hwm1 hwm2 conflate2?)]
+    (set-peer! pipe1 pipe2 mbox2)
+    (set-peer! pipe2 pipe1 mbox1)
     (doto (make-array Pipe 2)
       (aset 0 pipe1)
       (aset 1 pipe2))))

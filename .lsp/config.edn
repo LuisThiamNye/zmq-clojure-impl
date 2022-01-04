@@ -1,3 +1,5 @@
 {:source-paths #{"bb" "src" "test"}
 
- :linters {:unused-public-var {:exclude #{tasks}}}}
+ :linters {:unused-public-var {:exclude #{tasks}}}
+
+ :cljfmt {:indents {#"^with-.+" [[:inner 0]]}}}

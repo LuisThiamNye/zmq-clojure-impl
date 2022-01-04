@@ -9,60 +9,7 @@
                       SelectionKey
                       Selector)))
 
-(defonce contexts (atom {}))
 
-(defrecord Handle
-           [sc poll-events-handler ops cancelled]
-  ())
-
-(defn new-handle [{:keys [sc poll-events-handler] :as fields}]
-  {:pre [(some? sc) (some? poll-events-handler)]}
-  (map->Handle fields))
-
-(defn process-retired []
-  (when @retired?
-    (vreset! retired? false)
-    (doseq [handle fdTable]
-      (let [selection-key (handle.fd.keyfor selector)]
-        (if (or (cancelled? handle)
-                (not (fd.isopen? handle)))
-          (do
-            (when (some? selection-key)
-              (.cancel selection-key))
-                  ;; TODO remove handle from fd table
-            )
-          (if (nil? selection-key)
-            (when (fd.isopen? handle)
-              (try
-                      ;; key = handle.fd.register (selector, handle.ops, handle);
-                      ;; assert (key != null);
-                (catch java.nio.channels.CancelledKeyException e
-                  (.printStackTrace e))
-                (catch java.nio.channels.ClosedChannelException e
-                  (.printStackTrace e))
-                (catch java.nio.channels.ClosedSelectorException e
-                  (.printStackTrace e))))
-            (when (.isValid selection-key)
-              (.interestOps selection-key (:ops handle)))))))))
-
-
-
-;; (defn destroy-poller []
-;;   (.close selector))
-
-(let [thread-name (str (::io-thread-name-prefix ctx) thread-id)
-      worker (Thread. (poller) thread-name)]
-  (.setDaemon worker true)
-  (.start worker))
-
-(.addShutdownHook
- (Runtime/getRuntime)
- (Thread.
-  (fn [] ;; TODO shut down all contexts
-    )))
-
-(defrecord IOThread
-           [status thread-obj mailbox])
 
 (defn create-context
   ([options]
@@ -82,6 +29,7 @@
                                                    n)
                                           (map->IOThread {:status :init})]))
                                   (range (::io-thread-count opts)))}))))
+
 
 
 

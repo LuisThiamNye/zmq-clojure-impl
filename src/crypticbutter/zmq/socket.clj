@@ -33,7 +33,7 @@
    ::heartbeat-timeout nil
    ::heartbeat-ttl nil
 
-   ::only-queue-connected? false ;; IMMEDIATE
+   ::only-fill-connected? false ;; IMMEDIATE
    ::invert-message-filtering false ;; INVERT_MATCHING
    ::ipv6-enabled false
    ::linger-duration nil
@@ -57,6 +57,10 @@
    ::recv-msg-limit 1000 ;; RCVHWM
    ::recv-timeout nil
 
+   ::send-buffer-size nil
+   ::send-msg-limit 1000 ;; SNDHWM
+   ::send-timeout nil
+
    ::reconnection-interval 100 ;; ms
    ::reconnection-max-interval nil
 
@@ -70,10 +74,6 @@
    ::router-notify? false
 
    ::routing-id nil
-
-   ::send-buffer-size nil
-   ::send-msg-limit 1000 ;; SNDHWM
-   ::send-timeout nil
 
    ::socks-proxy-addr nil
 

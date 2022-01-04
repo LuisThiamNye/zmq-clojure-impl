@@ -19,12 +19,22 @@
 ::done ;; reaper->term when all sockets deallocated
 ::cancel
 
-(defrecord Command [cmd destination data])
+(defprotocol Commandable
+  (handle-cmd [_ cmd data]))
 
-(defn new-command
-  ([cmd destination] (->Command cmd destination nil))
-  ([cmd destination data] (->Command cmd destination data)))
+(defrecord Command [^clojure.lang.Keyword cmd
+                    destination ;; Commandable
+                    data])
+
+(defn new-cmd
+  ([cmd destination]
+   (->Command cmd destination nil))
+  ([cmd destination data]
+   (->Command cmd destination data)))
 
 (defn send-cmd!
   ([ctx cmd destination])
   ([ctx cmd destination data]))
+
+(defn execute! [^Command cmd]
+  (handle-cmd (:destination cmd) (:cmd cmd) (:data cmd)))

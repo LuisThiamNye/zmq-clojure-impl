@@ -4,15 +4,20 @@
    [farolero.core :as f :refer [signal error warn]]
    [taoensso.encore :as enc]
    [crypticbutter.snoop :refer [>defn => >defn-]]
-   [cyrpticbutter.zmq.impl.msg :as msg])
+   [crypticbutter.zmq.impl.cmd :as cmd :refer [Commandable]]
+   [crypticbutter.zmq.impl.poller :as poller]
+   [crypticbutter.zmq.impl.pipe :as pipe]
+   [crypticbutter.zmq.impl.mailbox :as mbox :refer [MailboxProtocol]]
+   [crypticbutter.zmq.impl.msg :as msg]
+   [crypticbutter.zmq.impl.util :as util])
   (:import
-   (java.nio.channels ServerSocketChannel)
+   (java.util HashSet)
+   (java.util.concurrent.locks ReentrantLock)
+   (java.nio.channels ServerSocketChannel SocketChannel Pipe$SourceChannel)
    (java.net InetAddress
-             StandardSocketOptions)))
-
-(def windows? (str/starts-with? (System/getProperty "os.name")
-                                "Windows"))
-
+             StandardSocketOptions)
+   (crypticbutter.zmq.impl.pipe Pipe)
+   (crypticbutter.zmq.impl.mailbox Signaller)))
 
 (derive ::error.invalid-endpoint :error/incorrect)
 (derive ::error.unsupported-protocol :error/unsupported)
@@ -34,117 +39,197 @@
   ;; fault (something went wrong that we do not know)
   ;; busy
 
-(def tcp-min-dyn-port 49152)
-(def tcp-max-dyn-port 65535)
+(defprotocol Socket
+  (get-base [_])
+  (send! [_ msg])
+  (recv! [_])
+  (get-options [_])
+  (awaiting-more? [_])
+  (attach-pipe! [_ pipe options]))
 
-(defn bind-to-random-port!
-  ([socket endpoint]
-   (bind-to-random-port!
-    socket endpoint tcp-min-dyn-port tcp-max-dyn-port))
-  ([socket endpoint min-port max-port]
-   (loop [port min-port]
-     (if (<= port max-port)
-       (if (try (.bind socket (str endpoint ":" port))
-                (catch Exception _ false))
-         true
-         (recur (inc port)))
-       false))))
+(defprotocol SocketCreator
+  (create-socket [_ id]))
 
-(defn connect
-  [sock endpoint])
+(def ^:const max-cmd-delay 3000000)
 
-(defn parse-tcp-auth [authority ipv6?]
-  (let [[_ input-host input-port] (re-matches #"(.+?)(?::(\d+))" authority)]
-    [(if (identical? "*" input-host)
-       (if ipv6?
-         "::"
-         "0.0.0.0")
-       input-host)
-     (if (or (nil? input-port)
-             (identical? "*" input-port))
-       0
-       (Integer/parseInt input-port))]))
+(deftype EndpointWithPipe
+  [endpoint
+   ^Pipe pipe])
 
-(>defn- socket-address
-  [host port ipv6?]
-  [string? nat-int? boolean? => :any]
-  (try
-    (let [ip-addrs (.getAllByName InetAddress host)
-          chosen-ip-addr (if ipv6?
-                           (or (some #(instance? java.net.Inet6Address %) ip-addrs)
-                               (first ip-addrs))
-                           (some #(instance? java.net.Inet4Address %) ip-addrs))]
-      (if (some? chosen-ip-addr)
-        (InetAddress. chosen-ip-addr port)
-        (error ::error.address-not-local
-               {:message (str host " not available for ipv6 enable state: " ipv6?)})))
-    (catch java.net.UnknownHostException e
-      (error ::error.address-not-local
-             {:message (.getMessage e)}))))
+(defprotocol IsSocketBase
+  (thread-safe? [_])
+  (register-pipe! [_ pipe socket])
+  (maybe-terminate-pipe! [_ pipe])
+  (add-endpoint! [_ addr endpoint pipe])
+  (terminate-endpoint! [_ addr])
+  (-process-commands! [_ timeout throttle])
+  (remove-pipe! [_ pipe])
+  (init-reaper-signaller! [_] "Returns the new signaller's handle")
+  (close! [_ after-hook] "After hook may get called within a lock")
+  (stop! [_])
+  (set-destroy-hook! [_ hook])
+  (maybe-destroy! [_]))
 
+(defmacro with-sock-lock [socket-base & body]
+  `(do (when (.thread-safe? ~socket-base)
+         (.lock (.-lock ~socket-base)))
+       (try
+         ~@body
+         (finally (when (.thread-safe? ~socket-base)
+                    (.unlock (.-lock ~socket-base)))))))
 
+(deftype SocketBase
+  ;; Encapsulates common socket functionality
+  [mailbox
+   ^:unsynchronized-mutable ^clojure.lang.PersistentHashMap endpoints
+   ^:unsynchronized-mutable ^:boolean alive?
+   ^:unsynchronized-mutable ^:boolean marked-destroyed?
+   ^HashSet pipes
+   ^:unsynchronized-mutable ^:long last-time-cmds-processed
+   ^:unsynchronized-mutable ^:int n-msgs-since-processed
+   ^:unsynchronized-mutable ^:boolean awaiting-more?
+   ^:unsynchronized-mutable ^Signaller reaper-signaller
+   ^:unsynchronized-mutable ^:boolean terminating?
+   ^:boolean thread-safe?
+   ^ReentrantLock lock
+   ^:unsynchronized-mutable ^clojure.lang.IFn destroy-hook]
 
-(>defn bind-tcp
-  [*ctx sock (authority string?)]
-  (let [ctx @*ctx]
-    (if-some [io-thread (choose-io-thread (vals (:ctx/io-threads ctx)))]
-      (let [sock-chan (.open ServerSocketChannel)]
-        (try
-          (let [ipv6? (::ipv6-enabled sock)
-                [host port] (parse-tcp-auth authority ipv6?)
-                snd-buf (::send-buffer-size sock)
-                rcv-buf (::recv-buffer-size sock)
-                sock-chan (doto sock-chan
-                            (.configureBlocking  false)
-                            (cond-> (some? snd-buf)
-                              (.setOption (.-SO_SNDBUF StandardSocketOptions)
-                                          snd-buf))
-                            (cond-> (some? rcv-buf)
-                              (.setOption (.-SO_SNDBUF StandardSocketOptions)
-                                          rcv-buf))
-                            (cond-> windows?
-                              (.setOption (.-SO_REUSEADDR StandardSocketOptions)
-                                          true)))]
-            (.bind (.socket sock-chan)
-                   (socket-address host port ipv6?)
-                   (::max-backlog sock))
-            (assoc sock ::socket-chan sock-chan))
-          (catch java.io.IOException _
-            (try (.close sock-chan)
-                 (catch java.io.IOException _
-                         ;; TODO
-                   ))
-            (error ::error.address-in-use
-                   {:message "The requested address is already in use."}))))
-      (error ::error.no-io-thread
-             {:message "No I/O thread is available to accomplish the task."}))))
+  mbox/HasMailbox
+  (get-mailbox [_] mailbox)
 
-(defn bind
-  "Accept incoming connections on a socket.
+  IsSocketBase
+  (thread-safe? [_] thread-safe?)
+  (register-pipe! [_ pipe socket]
+    (pipe/set-event-sink! pipe socket)
+    (.add pipes pipe))
+  (maybe-terminate-pipe! [_ pipe]
+    (when terminating?
+      (pipe/terminate! pipe false)))
+  (stop! [this] (mbox/send! mailbox (cmd/new-cmd ::cmd/stop this)))
+  (add-endpoint! [this addr endpoint pipe]
+    (with-sock-lock this
+      (set! endpoints (update endpoints addr
+                              #(util/set-conj % (->EndpointWithPipe endpoint pipe))))))
+  (terminate-endpoint! [this addr]
+    (with-sock-lock this
+      (let [endpoints' (get endpoints addr)]
+        (set! endpoints (disj endpoints addr))
+        (if (or (nil? endpoints') (empty? endpoints'))
+          (error "ENOENT")
+          (doseq [^EndpointWithPipe ep endpoints']
+            (when (some? (.-pipe ep))
+              (pipe/terminate! (.-pipe ep) true))
+            (mbox/send! (mbox/get-mailbox ^mbox/HasMailbox (.-endpoint ep))
+                        (cmd/new-cmd ::cmd/term (.-endpoint ep) #_linger ;; TODO
+                                     )))))))
+  (-process-commands! [_ timeout throttle?]
+    (let [first-cmd (if (zero? timeout)
+                      (mbox/recv! mailbox timeout)
+                      (let [time (System/nanoTime)]
+                        (or (and throttle?
+                                 (and (<= last-time-cmds-processed time)
+                                      (<= (- time last-time-cmds-processed) max-cmd-delay))
+                                 ::return)
+                            (do (when throttle?
+                                  (set! last-time-cmds-processed time))
+                                (mbox/recv! mailbox 0)))))]
+      (loop [cmd first-cmd]
+        (cmd/execute! cmd)
+        (when-some [next-cmd (mbox/recv! mailbox 0)]
+          (recur next-cmd)))))
+  (remove-pipe! [_ pipe] (.remove pipes pipe))
+  (init-reaper-signaller! [_]
+    (util/with-lock lock
+      (set! reaper-signaller (mbox/new-signaller))
+      (mbox/add-signaller! mailbox reaper-signaller)
+      (mbox/sig-send! reaper-signaller)
+      (mbox/sig-handle reaper-signaller)))
+  (close! [this after-hook]
+    (set! alive? false)
+    (with-sock-lock this
+      (when thread-safe?
+        (mbox/clear-signallers! mailbox))
+      (after-hook)))
+  (set-destroy-hook! [_ hook]
+    (set! destroy-hook hook))
+  (maybe-destroy! [_]
+    (when marked-destroyed?
+      (destroy-hook)
+      (try (mbox/close! mailbox)
+           (catch java.io.IOException _silent))
+      (when (some? reaper-signaller)
+        (try (mbox/sig-close! reaper-signaller)
+             (catch java.io.IOException _silent)))))
 
-  Endpoint must be local."
-  [*ctx sock endpoint]
-  (let [[_ scheme authority]
-        (re-matches #"(\w+)://(.+)" endpoint)]
-    (when false ;; TODO
-      (error ::error.context-terminated
-             {:message "The ØMQ context associated with the specified socket was terminated."}))
-    (case scheme
-      "inproc" (do
-                 ;; TODO register endpoint
-                 (error ::error.address-in-use
-                        {:message "The requested address is already in use."}))
-      "tcp" (bind-tcp *ctx sock authority)
-      (error ::error.unsupported-protocol
-             {:message "The requested transport protocol is not supported."}))))
+  poller/HandlesEventIn
+  (handle-in [this]
+    (with-sock-lock this
+      (when thread-safe?
+        (mbox/sig-recv! reaper-signaller))
+      (-process-commands! this 0 false))
+    (maybe-destroy! this))
 
-(defn close
-  [sock]
-  (.close sock))
+  Commandable
+  (handle-cmd [this cmd data]
+    (case cmd
+      ::cmd/stop nil
+      ::cmd/bind (attach-pipe! this ^pipe/Pipe data false)
+      ::cmd/term
+      (let [^:int linger data]
+        (doseq [pipe pipes]
+          (pipe/send-disconnect-msg! pipe)
+          (pipe/terminate! pipe false))
+        ;; (own/handle-term) ;; TODO
+        (set! terminating? true)))))
 
-(defn socket
-  "Creates a socket"
-  ([ctx sock-type] (socket ctx sock-type {}))
-  ([ctx sock-type {:keys [bind connect subscribe]}]
+(defn new-socket-base [id thread-safe?]
+  (let [lock (ReentrantLock.)]
+    (->SocketBase (if thread-safe?
+                   (mbox/new-safe-mailbox lock (str "safe-socket-" id))
+                   (mbox/new-mailbox (str "socket-" id)))
+                  {} ;; endpoints
+                  true ;; alive?
+                  false ;; marked destroyed?
+                  (HashSet.) ;; pipes
+                  0 ;; last time commands processed
+                  0 ;; n messages since last processed
+                  false ;; awaiting-more?
+                  nil ;; reaper signaller
+                  false ;; terminating?
+                  thread-safe?
+                  (when thread-safe? (ReentrantLock.))
+                  nil ;; destroy hook
+                  )))
 
-   (.open ServerSocketChannel)))
+(defmacro with-attach-pipe! [socket socket-base pipe & body]
+  `(do
+     (register-pipe! ~socket-base ~pipe ~socket)
+     ~@body
+     (maybe-terminate-pipe! ~socket-base ~pipe)))
+
+#_(comment
+    (def ^:const event-flag-connected 1)
+    (def ^:const event-flag-connect-delayed (bit-shift-left 1 1))
+    (def ^:const event-flag-connect-retired (bit-shift-left 1 2))
+    (def ^:const event-flag-listening (bit-shift-left 1 3))
+    (def ^:const event-flag-bind-failed (bit-shift-left 1 4))
+    (def ^:const event-flag-accepted (bit-shift-left 1 5))
+    (def ^:const event-flag-accept-failed (bit-shift-left 1 6))
+    (def ^:const event-flag-closed (bit-shift-left 1 7))
+    (def ^:const event-flag-close-failed (bit-shift-left 1 8))
+    (def ^:const event-flag-disconnected (bit-shift-left 1 9))
+    (def ^:const event-flag-monitor-stopped (bit-shift-left 1 10))
+    (def ^:const event-flag-handshake-protocol (bit-shift-left 1 15))
+    (def ^:const event-flag-all (dec (enc/pow 2 16)))
+
+  ;; monitor sockets are inproc only
+    monitor-sock
+    monitor-events-bitmask
+    monitor-sync
+    (-stop-monitor! [_]
+                    (when (some? monitor-sock)
+                      (when (not= 0 (bit-and monitor-events-bitmask event-flag-monitor-stopped))
+                        (event-flag-monitor-stopped "" 0))
+                      (close! monitor-sock)
+                      (set! monitor-sock nil)
+                      (set! monitor-events-bitmask 0))))
